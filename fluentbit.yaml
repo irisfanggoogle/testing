@@ -1,0 +1,741 @@
+# This is a clone of fluentbit 1.12.2 designed to run in GKE standard and to actually run at
+# the same time as a system logging agent (it uses different fluent-bit position files, etc).
+#
+# Options:
+# AddonImageRegistry: gke.gcr.io
+# SystemOnlyLogging: false
+# EnableNodeJournal: false
+# EnablePodSecurityPolicy: false
+# DaemonsConfig: only fluentbit-gke-big (Autopilot)
+#
+# The CPU request of the fluentbit container was set to the sum of the CPU requests for both fluentbit and fluentbit-gke from the system logging agent.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fluentbit-gke-1-12-2-clone
+---
+# The stackdriver output plugins will use the credentials from the metadata server.
+# In Autopilot, that's the GKE metadata server. It will have the workload identity credentials for the service account of the pod.
+# Add the iam.gke.io/gcp-service-account=[GSA_NAME]@[PROJECT_ID].iam.gserviceaccount.com annotation to your Kubernetes service account.
+# The GCP service account should have permission for logging.logEntries.create (for example, by granting roles/logging.logWriter).
+# In addition, you need to give the KSA in the project's workload identity pool the ability to use the GCP SA. For example:
+# gcloud iam service-accounts add-iam-policy-binding fluentbit@giulianosider-anthos-gke-dev.iam.gserviceaccount.com \
+#    --role roles/iam.workloadIdentityUser \
+#    --member "serviceAccount:giulianosider-anthos-gke-dev.svc.id.goog[fluentbit-gke-1-12-2-clone/fluentbit-gke]"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentbit-gke
+  namespace: fluentbit-gke-1-12-2-clone
+  annotations:
+    # TODO: Inject your service account and project here.
+    iam.gke.io/gcp-service-account: "fluentbit@giulianosider-anthos-gke-dev.iam.gserviceaccount.com"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluentbit-gke-1-12-2-clone-pod-label-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluentbit-gke-pod-label-reader
+subjects:
+- kind: ServiceAccount
+  name: fluentbit-gke
+  namespace: fluentbit-gke-1-12-2-clone
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: scrape-fluentbit-gke-1-12-2-clone
+  namespace: fluentbit-gke-1-12-2-clone
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluentbit-gke-1-12-2-clone
+  endpoints:
+  - port: flbgke-metrics
+    interval: 30s
+    path: /metrics
+  - port: flb-metrics
+    interval: 30s
+    path: /api/v1/metrics/prometheus
+---
+# See https://cloud.google.com/kubernetes-engine/docs/concepts/persistent-volumes#dynamic_provisioning.
+# The filestore CSI driver is enabled by default on Autopilot: https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/filestore-csi-driver#new.
+# Make sure to enable the Cloud Filestore API: https://console.developers.google.com/apis/api/file.googleapis.com/overview.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fluentbitposfiles
+  namespace: fluentbit-gke-1-12-2-clone
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Keep in mind that the allowed read/write throughput will likely be proportional to the amount of requested storage
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard-rwx
+---
+apiVersion: v1
+data:
+  fluent-bit.conf: |-
+    [SERVICE]
+        Flush         5
+        Grace         30
+        Log_Level     info
+        # Log to stderr by default: https://docs.fluentbit.io/manual/v/1.8/administration/configuring-fluent-bit/configuration-file#config_section
+        Daemon        off
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_PORT     4020
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers_kube-system
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*_kube-system_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube_kube-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers_istio-system
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*_istio-system_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube_istio-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers_knative-serving
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*_knative-serving_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube_knative-serving.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers_gke-system
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*_gke-system_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube_gke-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers_config-management-system
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*_config-management-system_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube_config-management-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+
+
+    [INPUT]
+        Name             tail
+        Alias            kube_containers
+        Tag              kube_<namespace_name>_<pod_name>_<container_name>
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/*.log
+        # Also exclude self-logs here. We can have self-logs go through a special path where we apply a throttle filter to avoid runaway log production due to self-loops.
+        Exclude_Path     /var/log/containers/fluentbit-gke-big*_fluentbit-gke-1-12-2-clone_*.log,/var/log/containers/*_kube-system_*.log,/var/log/containers/*_istio-system_*.log,/var/log/containers/*_knative-serving_*.log,/var/log/containers/*_gke-system_*.log,/var/log/containers/*_config-management-system_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/flb_kube.db
+        Buffer_Max_Size  20MB
+        Mem_Buf_Limit    100MB
+        Skip_Long_Lines  On
+        Refresh_Interval 1
+        Read_from_Head   True
+
+    # We can't collect these knative-var-logs from a non-system pod in Autopilot because we can only
+    # host mount /var/log.
+    #
+    # This input plugin is used to collect the logs located inside the /var/log
+    # directory of a Cloud Run on GKE / Knative container. Knative mounts
+    # an emptyDir volume named 'knative-var-log' inside the user container and
+    # if collection is enabled it creates a symbolic link inside another
+    # emptyDir named 'knative-internal' that contains the information needed for
+    # Kubernetes metadata enrichment.
+    #
+    # Concretely, on the host the symbolic link is:
+    # /var/lib/kubelet/pods/<POD_ID>/volumes/kubernetes.io~empty-dir/knative-internal/<NAMESPACE_NAME>_<POD_NAME>_<CONTAINER_NAME>
+    # ->
+    # /var/lib/kubelet/pods/<POD_ID>/volumes/kubernetes.io~empty-dir/knative-var-log
+    # [INPUT]
+    #     Name             tail
+    #     Alias            knative
+    #     Tag              kube_<namespace_name>_<pod_name>_<container_name>
+    #     Tag_Regex        \/var\/lib\/kubelet\/pods\/.+\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+    #     Path             /var/lib/kubelet/pods/*/volumes/kubernetes.io~empty-dir/knative-internal/**/*/**/*
+    #     DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/knative.db
+    #     Buffer_Max_Size  1MB
+    #     Mem_Buf_Limit    1MB
+    #     Skip_Long_Lines  On
+    #     Refresh_Interval 5
+    #     Read_from_Head   True
+
+    [FILTER]
+        Name         parser
+        Match        kube_*
+        Key_Name     log
+        Reserve_Data True
+        Parser       docker
+        Parser       containerd
+
+    # This input is used  to watch changes to Kubernetes pod log files live in the
+    # directory /var/log/pods/NAMESPACE_NAME_UID. The file name is used to
+    # capture the pod namespace, name and runtime name.
+
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor_kube-system
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Path             /var/log/pods/kube-system_*/*
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor_kube-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor_istio-system
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Path             /var/log/pods/istio-system_*/*
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor_istio-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor_knative-serving
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Path             /var/log/pods/knative-serving_*/*
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor_knative-serving.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor_gke-system
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Path             /var/log/pods/gke-system_*/*
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor_gke-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor_config-management-system
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Path             /var/log/pods/config-management-system_*/*
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor_config-management-system.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+
+
+    [INPUT]
+        Name             tail
+        Alias            gvisor
+        Tag              kube-pod_<namespace_name>_<pod_name>_<runtime>
+        Tag_Regex        \/var\/log\/pods\/(?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<id>[\-a-z0-9]+)\/(?<runtime>[a-z]+)\.log
+        Exclude_Path     /var/log/pods/kube-system_*/*,/var/log/pods/istio-system_*/*,/var/log/pods/knative-serving_*/*,/var/log/pods/gke-system_*/*,/var/log/pods/config-management-system_*/*
+        Path             /var/log/pods/*/*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gvisor.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    1MB
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+
+    # Example:
+    # Dec 21 23:17:22 gke-foo-1-1-4b5cbd14-node-4eoj startupscript: Finished running startup script /var/run/google.startup.script
+    [INPUT]
+        Name   tail
+        Parser syslog
+        Path   /var/log/startupscript.log
+        DB     /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/startupscript.db
+        Alias  startupscript
+        Tag    startupscript
+
+    # Logs from anetd for policy action
+    [INPUT]
+        Name             tail
+        Parser           network-log
+        Alias            policy-action
+        Tag              policy-action
+        Path             /var/log/network/policy_action.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/policy-action.db
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    # Example:
+    # I1118 21:26:53.975789       6 proxier.go:1096] Port "nodePort for kube-system/default-http-backend:http" (:31429/tcp) was open before and is still needed
+    [INPUT]
+        Name            tail
+        Alias           kube-proxy
+        Tag             kube-proxy
+        Path            /var/log/kube-proxy.log
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kube-proxy.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+        Parser          glog
+        Read_from_Head  True
+
+    [INPUT]
+        Name             tail
+        Alias            fluentbit-gke-1-12-2-clone
+        Tag              fluentbit-gke-1-12-2-clone
+        Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
+        Path             /var/log/containers/fluentbit-gke-big*_fluentbit-gke-1-12-2-clone_*.log
+        DB               /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/fluentbit.db
+        Buffer_Max_Size  1MB
+        Mem_Buf_Limit    5MB
+        Parser           fluentbit
+        Skip_Long_Lines  On
+        Refresh_Interval 5
+        Read_from_Head   True
+
+    # Prevent runaway production of fluent-bit logs (i.e. due to an infinite loop) by rate-limiting to 600 lines/minute.
+    [FILTER]
+        Name     throttle
+        Alias    throttle-fluentbit-self-logs
+        Match    fluentbit-gke-1-12-2-clone
+        Rate     600
+        Window   5
+        Interval 1m
+
+    # Logs from systemd-journal for interesting services.
+
+    [INPUT]
+        Name            systemd
+        Alias           docker
+        Tag             docker
+        Systemd_Filter  _SYSTEMD_UNIT=docker.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/docker.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kubelet
+        Tag             kubelet
+        Systemd_Filter  _SYSTEMD_UNIT=kubelet.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kubelet.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kube-node-installation
+        Tag             kube-node-installation
+        Systemd_Filter  _SYSTEMD_UNIT=kube-node-installation.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kube-node-installation.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kube-node-configuration
+        Tag             kube-node-configuration
+        Systemd_Filter  _SYSTEMD_UNIT=kube-node-configuration.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kube-node-configuration.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kube-logrotate
+        Tag             kube-logrotate
+        Systemd_Filter  _SYSTEMD_UNIT=kube-logrotate.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kube-logrotate.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           node-problem-detector
+        Tag             node-problem-detector
+        Systemd_Filter  _SYSTEMD_UNIT=node-problem-detector.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/node-problem-detector.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kube-container-runtime-monitor
+        Tag             kube-container-runtime-monitor
+        Systemd_Filter  _SYSTEMD_UNIT=kube-container-runtime-monitor.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kube-container-runtime-monitor.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           kubelet-monitor
+        Tag             kubelet-monitor
+        Systemd_Filter  _SYSTEMD_UNIT=kubelet-monitor.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/kubelet-monitor.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           gcfsd
+        Tag             gcfsd
+        Systemd_Filter  _SYSTEMD_UNIT=gcfsd.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gcfsd.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+    [INPUT]
+        Name            systemd
+        Alias           gcfs-snapshotter
+        Tag             gcfs-snapshotter
+        Systemd_Filter  _SYSTEMD_UNIT=gcfs-snapshotter.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/gcfs-snapshotter.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+
+    [INPUT]
+        Name            systemd
+        Alias           container-runtime
+        Tag             container-runtime
+        Systemd_Filter  _SYSTEMD_UNIT=containerd.service
+        Path            /var/log/journal
+        DB              /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}/container-runtime.db
+        Buffer_Max_Size 1MB
+        Mem_Buf_Limit   1MB
+
+
+    [FILTER]
+        Name        modify
+        Match       *
+        Hard_rename log message
+
+    [FILTER]
+        Name         parser
+        Match        kube_*
+        Key_Name     message
+        Reserve_Data True
+        Parser       glog
+        Parser       json
+
+    # level is a common synonym for severity,
+    # the default field name in libraries such as GoLang's zap.
+    # populate severity with level, if severity does not exist.
+    [FILTER]
+        Name        modify
+        Match       kube_*
+        Copy        level severity
+
+    [FILTER]
+        Name modify
+        Match_Regex ^(startupscript|policy_action|kube-proxy|fluentbit-gke-1-12-2-clone|docker|kubelet|kube-node-installation|kube-node-configuration|kube-logrotate|node-problem-detector|kube-container-runtime-monitor|kubelet-monitor|gcfsd|gcfs-snapshotter|container-runtime)$
+        Add logging.googleapis.com/local_resource_id k8s_node.${NODE_NAME}
+        # Use tag as log name.
+
+    [FILTER]
+        Name modify
+        Match kube-pod_*
+        Add logging.googleapis.com/logName gvisor-pod
+    
+    [FILTER]
+        Name modify
+        Match kube_*
+        Add logging.googleapis.com/logName container
+    
+    [OUTPUT]
+        Name stackdriver
+        Alias export_node_logs_to_stackdriver
+        Match_Regex ^(startupscript|policy_action|kube-proxy|fluentbit-gke-1-12-2-clone|docker|kubelet|kube-node-installation|kube-node-configuration|kube-logrotate|node-problem-detector|kube-container-runtime-monitor|kubelet-monitor|gcfsd|gcfs-snapshotter|container-runtime)$
+        Resource k8s_node
+        k8s_cluster_name ${CLUSTER_NAME}
+        k8s_cluster_location ${CLUSTER_LOCATION}
+        severity_key severity
+        workers 1
+    
+    [OUTPUT]
+        Name stackdriver
+        Alias export_gvisor_pod_logs_to_stackdriver
+        Match kube-pod_*
+        Resource k8s_pod
+        k8s_cluster_name ${CLUSTER_NAME}
+        k8s_cluster_location ${CLUSTER_LOCATION}
+        tag_prefix kube-pod_
+        custom_k8s_regex (?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_.*
+        severity_key severity
+        workers 1
+    
+    [OUTPUT]
+        Name stackdriver
+        Alias export_container_logs_to_stackdriver
+        Match kube_*
+        Resource k8s_container
+        k8s_cluster_name ${CLUSTER_NAME}
+        k8s_cluster_location ${CLUSTER_LOCATION}
+        tag_prefix kube_
+        custom_k8s_regex (?<namespace_name>[^_]+)_(?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<container_name>.+)
+        severity_key severity
+        workers 1
+
+    # For debugging only.
+    [OUTPUT]
+        Name stdout
+        Alias stdout-debugging
+        Match *
+
+  parsers.conf: |-
+    [PARSER]
+        Name        docker
+        Format      json
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+    [PARSER]
+        Name        containerd
+        Format      regex
+        # The timestamp is described in https://www.rfc-editor.org/rfc/rfc3339#section-5.6
+        Regex       ^(?<time>[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+    [PARSER]
+        Name        json
+        Format      json
+
+    [PARSER]
+        Name        syslog
+        Format      regex
+        Regex       ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+        Time_Key    time
+        Time_Format %b %d %H:%M:%S
+
+    [PARSER]
+        Name        glog
+        Format      regex
+        Regex       ^(?<severity>\w)(?<time>\d{4} [^\s]*)\s+(?<pid>\d+)\s+(?<source_file>[^ \]]+)\:(?<source_line>\d+)\]\s(?<message>.*)$
+        Time_Key    time
+        Time_Format %m%d %H:%M:%S.%L%z
+
+    [PARSER]
+        Name        network-log
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+    # Example:
+    # [2023/01/05 00:01:58] [ info] [output:http:http.0] 127.0.0.1:2021, HTTP status=200\
+    # Rubular: https://screenshot.googleplex.com/8SvHiZJLUkW9idQ
+    [PARSER]
+        Name   fluentbit
+        Format regex
+        Regex  ^\[(?<time>[^\]]+)\][ ]*\[[ ]*(?<severity>[^\]]+)\][ ]*\[(?<plugin>[^\]]+)\] (?<log>.*)
+        Time_Key time
+        Time_Format %Y/%m/%d %H:%M:%S
+kind: ConfigMap
+metadata:
+  name: fluentbit-gke-config-v1.2.0
+  namespace: fluentbit-gke-1-12-2-clone
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    k8s-app: fluentbit-gke-1-12-2-clone
+    nodeType: big
+  name: fluentbit-gke-big
+  namespace: fluentbit-gke-1-12-2-clone
+spec:
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      component: fluentbit-gke-1-12-2-clone
+      k8s-app: fluentbit-gke-1-12-2-clone
+      nodeType: big
+  template:
+    metadata:
+      annotations:
+        EnableNodeJournal: "false"
+        EnablePodSecurityPolicy: "false"
+        SystemOnlyLogging: "false"
+        components.gke.io/component-name: fluentbit
+        components.gke.io/component-version: 1.12.2
+        monitoring.gke.io/path: /api/v1/metrics/prometheus
+      labels:
+        component: fluentbit-gke-1-12-2-clone
+        k8s-app: fluentbit-gke-1-12-2-clone
+        nodeType: big
+    spec:
+      initContainers:
+      - name: init-fluentbitposfiles-directory
+        image: gke.gcr.io/gke-distroless/bash:20220419@sha256:ae3ca4f02f34781b65402d399ce64e48ee7dd756e901676fca17c25178db4049
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: fluentbitposfiles
+          mountPath: /pos-files-fluentbit-gke-1-12-2-clone
+        command:
+        - /bin/bash
+        - '-c'
+        - |-
+          mkdir -p /pos-files-fluentbit-gke-1-12-2-clone/${NODE_NAME}
+      containers:
+      - image: gke.gcr.io/fluent-bit@sha256:436f3b7a38522314dd3db22ae8187192d928763c29e94d04c0900b34f0ca0779
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /
+            port: 4020
+            scheme: HTTP
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: fluentbit
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: spec.nodeName
+        - name: CLUSTER_NAME
+          value: rapid-autopilot-cluster # TODO: Inject your own value here.
+        - name: CLUSTER_LOCATION
+          value: us-central1 # TODO: Inject your own value here.
+        ports:
+        - containerPort: 4020
+          name: flb-metrics
+          protocol: TCP
+        resources:
+          limits:
+            memory: 250Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - DAC_OVERRIDE
+            drop:
+            - all
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/log
+          name: varlog
+          readOnly: true
+        - mountPath: /pos-files-fluentbit-gke-1-12-2-clone
+          name: fluentbitposfiles
+        - mountPath: /fluent-bit/etc/
+          name: config-volume
+      # For debugging only.
+      - name: debugger
+        image: ubuntu
+        volumeMounts:
+        - name: fluentbitposfiles
+          mountPath: /pos-files-fluentbit-gke-1-12-2-clone
+        command:
+        - /bin/bash
+        - '-c'
+        - |-
+          sleep infinity
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/os: linux
+      restartPolicy: Always
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccount: fluentbit-gke
+      serviceAccountName: fluentbit-gke
+      tolerations:
+      - effect: NoExecute
+        operator: Exists
+      - effect: NoSchedule
+        operator: Exists
+      - key: components.gke.io/gke-managed-components
+        operator: Exists
+      volumes:
+      - hostPath:
+          path: /var/log
+          type: Directory
+        name: varlog
+      - name: fluentbitposfiles
+        persistentVolumeClaim:
+          claimName: fluentbitposfiles
+      - configMap:
+          defaultMode: 420
+          name: fluentbit-gke-config-v1.2.0
+        name: config-volume
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
